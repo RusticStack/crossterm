@@ -1,0 +1,39 @@
+name: Skua
+# Skua Bash's crossterm (RusticStack/crossterm, branch skua/0.29-windows-input): build and test on Windows, the only platform Skua ships.
+on:
+  push:
+    branches: [ skua/0.29-windows-input ]
+  pull_request:
+    branches: [ skua/0.29-windows-input ]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+jobs:
+  windows:
+    runs-on: blacksmith-4vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up rust toolchain
+        shell: bash
+        # No rust-toolchain file in this repo: use stable.
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Skua Bash (via brush-shell and reedline) enables the default features
+      # (bracketed-paste, events, windows, derive-more) plus serde.
+      - name: Build
+        run: cargo build --features serde --all-targets
+      - name: Test
+        run: cargo test --features serde -- --test-threads 1
