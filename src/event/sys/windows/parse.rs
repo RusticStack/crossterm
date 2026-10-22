@@ -219,13 +219,10 @@ fn parse_key_event_record(key_event: &KeyEventRecord) -> Option<WindowsKeyEvent>
                 // u16 values that are invalid when directly interpreted as unicode scalar
                 // values.
                 let ch = std::char::from_u32(unicode_scalar_value as u32).unwrap();
-                let key_code = KeyCode::Char(ch);
-                let kind = if key_event.key_down {
-                    KeyEventKind::Press
-                } else {
-                    KeyEventKind::Release
-                };
-                let key_event = KeyEvent::new_with_kind(key_code, modifiers, kind);
+                // The Alt release is when the character is typed: report it as a press, as the
+                // surrogate pairing does, or readers that skip releases drop it (the console
+                // sends pasted ZWJs and combining marks this way). (Skua fork.)
+                let key_event = KeyEvent::new(KeyCode::Char(ch), modifiers);
                 return Some(WindowsKeyEvent::KeyEvent(key_event));
             }
         }
@@ -269,6 +266,14 @@ fn parse_key_event_record(key_event: &KeyEventRecord) -> Option<WindowsKeyEvent>
                     get_char_for_key(key_event).map(KeyCode::Char)
                 }
                 surrogate @ 0xD800..=0xDFFF => {
+                    // A pseudoconsole (OpenConsole) and other KEYEVENTF_UNICODE senders deliver
+                    // each UTF-16 unit of a non-BMP character as a key-down and a key-up record.
+                    // Only the key-down carries the unit into the pairing: a key-up would pair
+                    // high with high and low with low, and the character would vanish. (Skua
+                    // fork; upstream issue #1072.)
+                    if !key_event.key_down {
+                        return None;
+                    }
                     return Some(WindowsKeyEvent::Surrogate(surrogate));
                 }
                 unicode_scalar_value => {
@@ -375,4 +380,123 @@ fn parse_mouse_event_record(
         row: ypos,
         modifiers,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm_winapi::{InputRecord, KeyEventRecord};
+    use winapi::um::wincontypes::{INPUT_RECORD, KEY_EVENT};
+
+    use super::handle_key_event;
+    use crate::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    const D: bool = true;
+    const U: bool = false;
+    const VK_MENU: u16 = 0x12;
+    const LEFT_ALT: u32 = 0x2;
+
+    fn record(key_down: bool, u_char: u16, virtual_key_code: u16, state: u32) -> KeyEventRecord {
+        // SAFETY: an all-zero INPUT_RECORD is valid; the key event fields are plain integers.
+        let mut raw: INPUT_RECORD = unsafe { std::mem::zeroed() };
+        raw.EventType = KEY_EVENT;
+        // SAFETY: EventType says the union holds a key event.
+        let key = unsafe { raw.Event.KeyEvent_mut() };
+        key.bKeyDown = key_down.into();
+        key.wRepeatCount = 1;
+        key.wVirtualKeyCode = virtual_key_code;
+        // SAFETY: the wide member of the character union.
+        unsafe { *key.uChar.UnicodeChar_mut() = u_char };
+        key.dwControlKeyState = state;
+        match InputRecord::from(raw) {
+            InputRecord::KeyEvent(key) => key,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Feeds the records in order and returns the characters pressed.
+    fn typed(records: &[(bool, u16, u16, u32)]) -> String {
+        let mut buffer = None;
+        let mut out = String::new();
+        for &(down, ch, vk, state) in records {
+            let event = handle_key_event(record(down, ch, vk, state), &mut buffer);
+            if let Some(Event::Key(key)) = event {
+                if let (KeyCode::Char(c), KeyEventKind::Press) = (key.code, key.kind) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    // Records as OpenConsole 1.25 (the pseudoconsole Skua bundles) makes them from UTF-8 "a😀b".
+    #[test]
+    fn pseudoconsole_surrogate_pairs() {
+        let records = [
+            (D, 0x61, 0x41, 0),
+            (U, 0x61, 0x41, 0),
+            (D, 0xD83D, 0, 0),
+            (U, 0xD83D, 0, 0),
+            (D, 0xDE00, 0, 0),
+            (U, 0xDE00, 0, 0),
+            (D, 0x62, 0x42, 0),
+            (U, 0x62, 0x42, 0),
+        ];
+        assert_eq!(typed(&records), "a\u{1F600}b");
+    }
+
+    // Both key-downs, then both key-ups.
+    #[test]
+    fn surrogate_downs_then_ups() {
+        let records = [
+            (D, 0xD83D, 0, 0),
+            (D, 0xDE00, 0, 0),
+            (U, 0xD83D, 0, 0),
+            (U, 0xDE00, 0, 0),
+        ];
+        assert_eq!(typed(&records), "\u{1F600}");
+    }
+
+    #[test]
+    fn zwj_sequence_and_flag() {
+        let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{1F1F5}\u{1F1F9}";
+        let records: Vec<_> = text
+            .encode_utf16()
+            .flat_map(|unit| [(D, unit, 0, 0), (U, unit, 0, 0)])
+            .collect();
+        assert_eq!(typed(&records), text);
+    }
+
+    // Records as the inbox conhost makes them from UTF-8 "a", ZWJ, "😀": Alt+numpad codes whose
+    // character comes with the Alt key-up.
+    #[test]
+    fn alt_codes_are_presses() {
+        let alt_code = |ch: u16| {
+            [
+                (D, 0, VK_MENU, LEFT_ALT),
+                (D, 0, 0x66, LEFT_ALT),
+                (U, 0, 0x66, LEFT_ALT),
+                (D, 0, 0x63, LEFT_ALT),
+                (U, 0, 0x63, LEFT_ALT),
+                (U, ch, VK_MENU, 0),
+            ]
+        };
+        let mut records = vec![(D, 0x61, 0x41, 0), (U, 0x61, 0x41, 0)];
+        records.extend(alt_code(0x200D));
+        records.extend(alt_code(0xD83D));
+        records.extend(alt_code(0xDE00));
+        assert_eq!(typed(&records), "a\u{200D}\u{1F600}");
+    }
+
+    #[test]
+    fn plain_keys_still_report_releases() {
+        let mut buffer = None;
+        match handle_key_event(record(U, 0x61, 0x41, 0), &mut buffer) {
+            Some(Event::Key(key)) => {
+                assert_eq!(key.code, KeyCode::Char('a'));
+                assert_eq!(key.kind, KeyEventKind::Release);
+                assert_eq!(key.modifiers, KeyModifiers::NONE);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
