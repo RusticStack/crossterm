@@ -146,7 +146,7 @@ use std::hash::{Hash, Hasher};
 
 /// Static instance of `InternalEventReader`.
 /// This needs to be static because there can be one event reader.
-static INTERNAL_EVENT_READER: Mutex<Option<InternalEventReader>> = parking_lot::const_mutex(None);
+static INTERNAL_EVENT_READER: Mutex<Option<InternalEventReader>> = Mutex::new(None);
 
 pub(crate) fn lock_internal_event_reader() -> MappedMutexGuard<'static, InternalEventReader> {
     MutexGuard::map(INTERNAL_EVENT_READER.lock(), |reader| {

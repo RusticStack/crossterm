@@ -51,12 +51,7 @@ impl InternalEventReader {
 
         let event_source = match self.source.as_mut() {
             Some(source) => source,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to initialize input reader",
-                ))
-            }
+            None => return Err(std::io::Error::other("Failed to initialize input reader")),
         };
 
         let poll_timeout = PollTimeout::new(timeout);
@@ -325,7 +320,7 @@ mod tests {
             reader
                 .poll(Some(Duration::from_secs(0)), &InternalEventFilter)
                 .err()
-                .map(|e| format!("{:?}", &e.kind())),
+                .map(|e| format!("{:?}", e.kind())),
             Some(format!("{:?}", io::ErrorKind::Other))
         );
     }
@@ -342,7 +337,7 @@ mod tests {
             reader
                 .read(&InternalEventFilter)
                 .err()
-                .map(|e| format!("{:?}", &e.kind())),
+                .map(|e| format!("{:?}", e.kind())),
             Some(format!("{:?}", io::ErrorKind::Other))
         );
     }
@@ -393,7 +388,7 @@ mod tests {
         fn new(events: &[InternalEvent]) -> FakeSource {
             FakeSource {
                 events: events.to_vec().into(),
-                error: Some(io::Error::new(io::ErrorKind::Other, "")),
+                error: Some(io::Error::other("")),
             }
         }
 
